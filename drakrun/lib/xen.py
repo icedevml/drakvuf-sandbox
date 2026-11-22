@@ -1,6 +1,10 @@
 import logging
+import os
+import pathlib
+import signal
 import subprocess
-from typing import Dict, Optional
+import time
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +85,80 @@ def xen_destroy_vm(vm_name: str) -> None:
 def xen_get_domid(vm_name: str) -> int:
     output = subprocess.check_output(["xl", "domid", vm_name], text=True)
     return int(output.strip())
+
+
+def _find_device_models(vm_name: str) -> List[Tuple[int, int]]:
+    """
+    Returns (pid, domid) of QEMU device model processes started by libxl for vm_name.
+    libxl starts them as 'qemu-system-i386 -xen-domid <domid> ... -name <vm_name> ...'
+    """
+    found = []
+    for proc in pathlib.Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            args = (proc / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        args = [arg.decode(errors="replace") for arg in args]
+        if not args or not args[0].endswith("qemu-system-i386"):
+            continue
+        try:
+            name = args[args.index("-name") + 1]
+            domid = int(args[args.index("-xen-domid") + 1])
+        except (ValueError, IndexError):
+            continue
+        if name == vm_name:
+            found.append((int(proc.name), domid))
+    return found
+
+
+def _xen_domid_exists(domid: int) -> bool:
+    result = subprocess.run(["xl", "list", str(domid)], capture_output=True)
+    return result.returncode == 0
+
+
+def xen_kill_leaked_device_models(vm_name: str, timeout: float = 30) -> None:
+    """
+    Kills QEMU device models left behind by a destroyed vm_name domain.
+
+    When QEMU hangs (e.g. deadlocks in its main loop), 'xl destroy' can't finish
+    tearing the domain down: it stays as a '(null)' dying domain held by the stuck
+    device model, and the next restore of the VM fails until the process is killed.
+    Only device models of vm_name whose domain is no longer vm_name are killed.
+    """
+    try:
+        live_domid = xen_get_domid(vm_name)
+    except (subprocess.CalledProcessError, ValueError):
+        live_domid = None
+
+    leaked = [
+        (pid, domid)
+        for pid, domid in _find_device_models(vm_name)
+        if domid != live_domid
+    ]
+    for pid, domid in leaked:
+        log.warning(
+            "Killing leaked device model of %s (pid %d, domid %d)", vm_name, pid, domid
+        )
+        try:
+            # SIGKILL: a deadlocked QEMU main loop doesn't handle SIGTERM
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + timeout
+    for pid, domid in leaked:
+        while time.monotonic() < deadline and (
+            pathlib.Path(f"/proc/{pid}").exists() or _xen_domid_exists(domid)
+        ):
+            time.sleep(0.5)
+        if _xen_domid_exists(domid):
+            log.error(
+                "Domain %d of %s still exists after killing its device model",
+                domid,
+                vm_name,
+            )
 
 
 def parse_xen_commandline(xen_commandline: str) -> Dict[str, str]:

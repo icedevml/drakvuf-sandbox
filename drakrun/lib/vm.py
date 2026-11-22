@@ -14,6 +14,7 @@ from .xen import (
     xen_eject_cd,
     xen_get_domid,
     xen_is_vm_running,
+    xen_kill_leaked_device_models,
     xen_restore_vm,
     xen_save_vm,
 )
@@ -136,8 +137,11 @@ class VirtualMachine:
 
     def destroy(self) -> None:
         log.info(f"Destroying {self.vm_name}")
-        if self.is_running:
-            xen_destroy_vm(self.vm_name)
+        try:
+            if self.is_running:
+                xen_destroy_vm(self.vm_name)
+        finally:
+            xen_kill_leaked_device_models(self.vm_name)
         stop_vm_network(self.vm_id)
         self._network_info = None
 
