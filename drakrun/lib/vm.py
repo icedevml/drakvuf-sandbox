@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 from typing import List, Optional
@@ -6,15 +7,16 @@ from .config import NetworkConfigSection
 from .install_info import InstallInfo
 from .network_info import NetworkInfo
 from .networking import get_network_info_path, start_vm_network, stop_vm_network
-from .paths import CONFIGS_DIR
+from .paths import CONFIGS_DIR, RUN_DIR
 from .storage import get_storage_backend
 from .xen import (
     xen_create_vm,
     xen_destroy_vm,
     xen_eject_cd,
+    xen_get_device_model_pid,
     xen_get_domid,
     xen_is_vm_running,
-    xen_kill_leaked_device_models,
+    xen_kill_device_model,
     xen_restore_vm,
     xen_save_vm,
 )
@@ -98,6 +100,7 @@ class VirtualMachine:
 
         vm_conf_path = self._generate_vm_conf(disks)
         xen_create_vm(self.vm_name, vm_conf_path.as_posix())
+        self._save_device_model_info()
 
     def restore(self, snapshot_path: Optional[str] = None, cold_boot=False) -> None:
         if not cold_boot and snapshot_path is None:
@@ -123,6 +126,7 @@ class VirtualMachine:
             xen_restore_vm(self.vm_name, vm_conf_path.as_posix(), snapshot_path)
         else:
             xen_create_vm(self.vm_name, vm_conf_path.as_posix())
+        self._save_device_model_info()
 
     def save(self, snapshot_path: Optional[str] = None) -> None:
         if snapshot_path is None:
@@ -135,13 +139,38 @@ class VirtualMachine:
         stop_vm_network(self.vm_id)
         self._network_info = None
 
+    @property
+    def _device_model_info_path(self) -> Path:
+        return RUN_DIR / f"devicemodel-{self.vm_id}.json"
+
+    def _save_device_model_info(self) -> None:
+        """Remembers the QEMU device model of the started VM (see _kill_device_model)"""
+        domid = self.get_domid()
+        pid = xen_get_device_model_pid(domid)
+        if pid is None:
+            log.warning("Could not find the device model PID of %s", self.vm_name)
+            return
+        RUN_DIR.mkdir(exist_ok=True)
+        self._device_model_info_path.write_text(
+            json.dumps({"domid": domid, "pid": pid})
+        )
+
+    def _kill_device_model(self) -> None:
+        """Kills the device model of the destroyed VM if it didn't exit by itself"""
+        try:
+            info = json.loads(self._device_model_info_path.read_text())
+        except (OSError, ValueError):
+            return
+        xen_kill_device_model(self.vm_name, info["domid"], info["pid"])
+        self._device_model_info_path.unlink(missing_ok=True)
+
     def destroy(self) -> None:
         log.info(f"Destroying {self.vm_name}")
         try:
             if self.is_running:
                 xen_destroy_vm(self.vm_name)
         finally:
-            xen_kill_leaked_device_models(self.vm_name)
+            self._kill_device_model()
         stop_vm_network(self.vm_id)
         self._network_info = None
 
